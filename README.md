@@ -18,7 +18,8 @@ primary product:
 
 1. decodes the class of every pixel (`level`, 0–9),
 2. writes a representative rain rate per class as `rain_rate` (mm/h),
-3. resamples from Web Mercator to a regular lat/lon grid with nearest neighbour.
+3. resamples from Web Mercator to a regular lat/lon grid, by nearest neighbour or by
+   the strongest class in each cell (`--method max`, the radar convention for thinning).
 
 Because the input is a class, `rain_rate` is quantised to nine discrete values. The class
 bounds and the representative values are recorded in the variable attributes, so you can
@@ -151,10 +152,45 @@ jma-radar fetch --zoom 6 --time 20260916012000 --valid 20260916015000
 # Other formats
 jma-radar fetch --zoom 6 --format png     --out preview.png
 jma-radar fetch --zoom 6 --format geotiff --out hrpns.tif  # rain_rate band; needs the 'geotiff' extra
+
+# Your own grid: a square 0.01° step, each cell the strongest class it contains
+jma-radar fetch --zoom 8 --step 0.01 --method max --bbox 121,20.5,149,45.5 --out hrpns_0p01.nc
+
+# A window of analyses as one series file (see below)
+jma-radar window --start 2026091523 --hours 3 --zoom 8 --step 0.01 --method max \
+    --bbox 121,20.5,149,45.5 --frames-dir ~/.cache/jma-radar/frames --out window.nc --json
 ```
 
 `--zoom` accepts 4, 6, 8 or 10 only; the default is 8. Without `--out`, the file is
-named `hrpns_{validtime}.{nc,tif,png}`.
+named `hrpns_{validtime}.{nc,tif,png}`. `python -m jma_radar` is the same entry point.
+
+### Resampling: `--method nearest | max`
+
+The output grid is coarser than the tile pixels at every zoom that is worth fetching
+(a z8 pixel is about 0.0055° of longitude; the default z8 grid is 1/80° × 1/120°, and a
+0.01° grid holds about 2 × 2 pixels per cell). `nearest` takes the pixel under each
+cell centre. `max` takes the highest class among the pixels whose centres fall in the
+cell: the classes are ordered by intensity, so this is the strongest rain the cell
+contains — the way radar products are thinned, since a nearest-neighbour pick drops
+small convective cores at random. Neither method averages; the values are classes.
+
+### Windows: `jma-radar window`
+
+`targetTimes_N1.json` lists the last three hours of analyses. `window` takes every
+analysis whose time lies between `--start` (a `YYYYMMDDHH` hour, or a full JMA stamp)
+and `--start + --hours`, brings each onto one grid, and writes them as **one NetCDF
+series** with a `time` dimension (`rain_rate(time, lat, lon)` and `level(time, lat,
+lon)`; `time` in seconds since the Unix epoch). With `--frames-dir`, every frame is
+also kept as an ordinary single-frame file under a directory keyed by the grid, and a
+later window fetches only the frames it lacks — a rolling rebuild every five minutes
+costs one frame of tiles. `--json` prints a summary (the grid, one entry per frame with
+its cache path) on stdout; progress and logs go to stderr.
+
+In the series file `rain_rate` is packed as a byte with `scale_factor = 0.5` and
+`_FillValue = 255`: every class representative value is a whole half-millimetre, so
+the packing is exact, and a reader that unscales (GDAL's NetCDF driver, xarray) gets
+mm/h back. This is the shape the [Xue](https://github.com/ringsaturn/xue) weather
+viewer ingests as its Japan radar source.
 
 ## Library
 
@@ -184,8 +220,17 @@ ds = jma_radar.to_dataset(grid, basetime=target.basetime, validtime=target.valid
 jma_radar.write_png(grid, "preview.png")  # quick-look, JMA colours
 ```
 
+# A window of analyses, frames cached one file each, stacked into one series
+frames, spec = jma_radar.fetch_window(
+    "2026091523", 3, zoom=8, step=0.01, bbox=(121, 20.5, 149, 45.5), method="max",
+    frames_dir="~/.cache/jma-radar/frames",
+)
+series = jma_radar.to_series_dataset([(f.grid, f.validtime) for f in frames], zoom=8, method="max")
+jma_radar.write_netcdf(series, "window.nc")
+
 Useful pieces: `decode_tile`, `level_to_dbz`, `level_to_rain_rate`, `rain_rate_to_dbz`,
-`make_grid`, `tile_bounds`, `parse_target_times`, `LEVEL_COLORS`, `LEVEL_LABELS`.
+`make_grid`, `tile_bounds`, `parse_target_times`, `window_target_times`, `read_levels`,
+`LEVEL_COLORS`, `LEVEL_LABELS`.
 
 ## NetCDF output
 
@@ -193,7 +238,7 @@ Dimensions `lat` (decreasing, north → south) and `lon`; coordinates are cell c
 
 | variable | dtype | units | notes |
 |---|---|---|---|
-| `rain_rate` | float32 | mm h-1 | primary product; class representative value; `NaN` for no data, `0` for no rain; attrs `class_bounds`, `class_representative_rain_rate` |
+| `rain_rate` | float32 | mm/h | primary product; class representative value; `NaN` for no data, `0` for no rain; attrs `class_bounds`, `class_representative_rain_rate` |
 | `level` | uint8 | 1 | `flag_values` 0…9, `flag_meanings` per the table above; 0 = no data |
 | `cref` | float32 | dBZ | only with `--dbz` / `dbz=True`; `NaN` for no data **and** for 0 mm/h; attrs `zr_a`, `zr_b` |
 
@@ -201,8 +246,10 @@ Global attributes: `title`, `product`, `source` (URL template), `element`, `base
 `validtime` (ISO 8601 UTC), `zoom`, `crs` (`EPSG:4326`), `Conventions`, `institution`,
 `disclaimer`, `created`.
 
-Resampling from Web Mercator to the lat/lon grid is **nearest neighbour** on purpose:
-the values are discrete classes and must not be averaged.
+Resampling from Web Mercator to the lat/lon grid is **nearest neighbour** by default,
+or the **strongest class per cell** with `--method max`; neither averages, because the
+values are discrete classes. A series file (`window`) adds a `time` dimension and packs
+`rain_rate` as a byte (`scale_factor` 0.5, fill 255).
 
 ## Polite usage
 

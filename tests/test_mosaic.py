@@ -124,3 +124,58 @@ def test_to_latlon_grid_outside_is_nodata() -> None:
     # Request a box far outside the mosaic; every cell must be no-data.
     grid = to_latlon_grid(mosaic, tile_range, bbox=(0.0, 0.0, 10.0, 10.0), dlon=1.0, dlat=1.0)
     assert (grid.levels == 0).all()
+
+
+def test_max_resampling_keeps_the_strongest_class_in_a_cell() -> None:
+    """A single strong pixel inside a coarse cell survives ``max`` and is
+    lost to ``nearest`` unless it happens to sit under the cell centre."""
+    tile_range = TileRange(z=6, x_min=52, x_max=52, y_min=22, y_max=22)
+    tile = np.full((256, 256), 2, dtype=np.uint8)
+    tile[10, 10] = 9  # one convective pixel near the tile's north-west corner
+    mosaic = assemble_mosaic({(52, 22): tile}, tile_range)
+    west, south, east, north = tile_bounds(6, 52, 22)
+    bbox = (west + 0.001, south + 0.001, east - 0.001, north - 0.001)
+    coarse = to_latlon_grid(mosaic, tile_range, bbox=bbox, dlon=1.0, dlat=1.0, method="max")
+    assert coarse.levels[0, 0] == 9
+    assert (coarse.levels[1:, :] == 2).all() and (coarse.levels[:, 1:] == 2).all()
+    nearest = to_latlon_grid(mosaic, tile_range, bbox=bbox, dlon=1.0, dlat=1.0, method="nearest")
+    assert nearest.levels[0, 0] == 2
+
+
+def test_max_resampling_matches_nearest_on_a_uniform_mosaic() -> None:
+    tile_range = TileRange(z=6, x_min=52, x_max=53, y_min=22, y_max=23)
+    tiles = {(x, y): _constant_tile(x - 50 + y - 20) for x, y in tile_range}
+    mosaic = assemble_mosaic(tiles, tile_range)
+    west, _, _, north = tile_bounds(6, 52, 22)
+    _, south, east, _ = tile_bounds(6, 53, 23)
+    bbox = (west + 0.05, south + 0.05, east - 0.05, north - 0.05)
+    a = to_latlon_grid(mosaic, tile_range, bbox=bbox, dlon=0.02, dlat=0.02, method="nearest")
+    b = to_latlon_grid(mosaic, tile_range, bbox=bbox, dlon=0.02, dlat=0.02, method="max")
+    # Cells finer than a pixel reduce to the pixel at their start: the same
+    # pick as nearest everywhere but along the tile seams.
+    assert (a.levels == b.levels).mean() > 0.99
+    assert a.shape == b.shape
+
+
+def test_max_resampling_outside_is_nodata_and_rejects_unknown_methods() -> None:
+    tile_range = domain_tile_range(4)
+    mosaic = np.full((tile_range.ny * 256, tile_range.nx * 256), 3, dtype=np.uint8)
+    grid = to_latlon_grid(
+        mosaic, tile_range, bbox=(0.0, 0.0, 10.0, 10.0), dlon=1.0, dlat=1.0, method="max"
+    )
+    assert (grid.levels == 0).all()
+    # A box straddling the mosaic's west edge: inside cells carry the data,
+    # outside cells no data.
+    west, _, _, _ = tile_bounds(4, tile_range.x_min, tile_range.y_min)
+    straddle = to_latlon_grid(
+        mosaic,
+        tile_range,
+        bbox=(west - 2.0, 30.0, west + 2.0, 32.0),
+        dlon=1.0,
+        dlat=1.0,
+        method="max",
+    )
+    assert (straddle.levels[:, :2] == 0).all()
+    assert (straddle.levels[:, 2:] == 3).all()
+    with pytest.raises(ValueError, match="method"):
+        to_latlon_grid(mosaic, tile_range, method="mean")  # type: ignore[arg-type]

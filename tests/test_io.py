@@ -29,7 +29,7 @@ def test_to_dataset_structure() -> None:
     assert dataset["level"].dtype == np.uint8
     assert dataset["rain_rate"].dtype == np.float32
     assert dataset["rain_rate"].dims == ("lat", "lon")
-    assert dataset["rain_rate"].attrs["units"] == "mm h-1"
+    assert dataset["rain_rate"].attrs["units"] == "mm/h"
     assert dataset.attrs["crs"] == "EPSG:4326"
     assert dataset.attrs["basetime"] == "2026-09-16T01:05:00Z"
     assert dataset.attrs["zoom"] == 6

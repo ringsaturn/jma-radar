@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -11,8 +13,10 @@ import typer
 from . import __version__, fetch_grid
 from .client import DEFAULT_CONCURRENCY, JmaTileClient
 from .constants import DEFAULT_ELEMENT, DEFAULT_ZR_A, DEFAULT_ZR_B, VALID_ZOOMS
-from .io import to_dataset, write_geotiff, write_netcdf, write_png
+from .io import to_dataset, to_series_dataset, write_geotiff, write_netcdf, write_png
+from .mosaic import ResampleMethod
 from .tiles import domain_tile_range
+from .window import fetch_window, parse_start
 
 app = typer.Typer(
     name="jma-radar",
@@ -48,6 +52,35 @@ def _parse_bbox(value: str | None) -> tuple[float, float, float, float] | None:
     except ValueError as error:
         raise typer.BadParameter(f"bbox must contain four numbers: {error}") from error
     return west, south, east, north
+
+
+def _parse_method(value: str) -> ResampleMethod:
+    """Validate a resampling method name."""
+    if value == "nearest":
+        return "nearest"
+    if value == "max":
+        return "max"
+    raise typer.BadParameter("method must be 'nearest' or 'max'")
+
+
+def _parse_step(value: str | None) -> float | tuple[float, float] | None:
+    """Parse a grid step: one number for a square grid, or ``dlon,dlat``."""
+    if value is None:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError as error:
+        raise typer.BadParameter(f"step must be a number or 'dlon,dlat': {error}") from error
+    if len(numbers) == 1:
+        step: float | tuple[float, float] = numbers[0]
+    elif len(numbers) == 2:
+        step = (numbers[0], numbers[1])
+    else:
+        raise typer.BadParameter("step must be a number or 'dlon,dlat'")
+    if any(number <= 0 for number in numbers):
+        raise typer.BadParameter("step must be positive")
+    return step
 
 
 def _parse_zr(value: str) -> tuple[float, float]:
@@ -93,6 +126,18 @@ def fetch(
         str | None, typer.Option(help="validtime YYYYMMDDHHMMSS for forecasts.")
     ] = None,
     bbox: Annotated[str | None, typer.Option(help="Subset as 'W,S,E,N' in degrees.")] = None,
+    step: Annotated[
+        str | None,
+        typer.Option(
+            help="Grid step in degrees, one number or 'dlon,dlat'; the zoom's own by default."
+        ),
+    ] = None,
+    method: Annotated[
+        str,
+        typer.Option(
+            help="Resampling: 'nearest' (pixel under the cell centre) or 'max' (strongest class)."
+        ),
+    ] = "nearest",
     out: Annotated[
         Path | None, typer.Option(help="Output path; defaults to hrpns_{validtime}.<ext>.")
     ] = None,
@@ -119,6 +164,14 @@ def fetch(
         raise typer.BadParameter("format must be netcdf, geotiff or png")
     box = _parse_bbox(bbox)
     zr_a, zr_b = _parse_zr(zr)
+    resampling = _parse_method(method)
+    grid_step = _parse_step(step)
+    dlon: float | None
+    dlat: float | None
+    if isinstance(grid_step, tuple):
+        dlon, dlat = grid_step
+    else:
+        dlon = dlat = grid_step
 
     tile_range = domain_tile_range(zoom)
     logger.info("downloading %d tiles at zoom %d", tile_range.count, zoom)
@@ -136,6 +189,9 @@ def fetch(
                 time=time,
                 valid=valid,
                 bbox=box,
+                dlon=dlon,
+                dlat=dlat,
+                method=resampling,
                 client=client,
                 progress=progress,
             )
@@ -165,6 +221,131 @@ def fetch(
         f"wrote {path} shape={grid.shape} basetime={target.basetime} "
         f"validtime={target.validtime} observed_cells={valid_count}"
     )
+
+
+@app.command()
+def window(
+    start: Annotated[
+        str, typer.Option(help="The window's first hour: YYYYMMDDHH (or a YYYYMMDDHHMMSS stamp).")
+    ],
+    hours: Annotated[
+        int, typer.Option(help="Window length in hours; analyses through start + hours are taken.")
+    ] = 3,
+    zoom: Annotated[int, typer.Option(help=f"Tile zoom level; one of {list(VALID_ZOOMS)}.")] = 8,
+    step: Annotated[
+        str | None,
+        typer.Option(
+            help="Grid step in degrees, one number or 'dlon,dlat'; the zoom's own by default."
+        ),
+    ] = None,
+    bbox: Annotated[str | None, typer.Option(help="Subset as 'W,S,E,N' in degrees.")] = None,
+    method: Annotated[
+        str,
+        typer.Option(
+            help="Resampling: 'nearest' (pixel under the cell centre) or 'max' (strongest class)."
+        ),
+    ] = "nearest",
+    frames_dir: Annotated[
+        Path | None,
+        typer.Option(
+            help="Directory caching one file per frame; frames already there are not fetched again."
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None, typer.Option(help="Series NetCDF path; defaults to hrpns_{start}_{hours}h.nc.")
+    ] = None,
+    cache_dir: Annotated[
+        Path | None, typer.Option(help="Directory used to cache raw tiles.")
+    ] = None,
+    concurrency: Annotated[
+        int, typer.Option(help="Parallel tile downloads.")
+    ] = DEFAULT_CONCURRENCY,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print a JSON summary of the window on stdout.")
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Verbose logging.")] = False,
+) -> None:
+    """Download every analysis of a window and write them as one NetCDF series.
+
+    The listing (targetTimes_N1) names the last three hours of analyses; a
+    window is those whose time lies between START and START + HOURS. With
+    --frames-dir, each frame is cached one file each and a repeated run
+    fetches only what the listing gained.
+    """
+    _configure_logging(verbose)
+    if zoom not in VALID_ZOOMS:
+        raise typer.BadParameter(f"zoom must be one of {list(VALID_ZOOMS)}")
+    if hours < 1:
+        raise typer.BadParameter("hours must be at least 1")
+    box = _parse_bbox(bbox)
+    resampling = _parse_method(method)
+    grid_step = _parse_step(step)
+    first_hour = parse_start(start)
+
+    # The progress bar goes to stderr so a --json summary owns stdout.
+    with typer.progressbar(length=1, label="frames", file=sys.stderr) as bar:
+        state = {"done": 0}
+
+        def progress(done: int, total: int) -> None:
+            bar.length = total
+            bar.update(done - state["done"])
+            state["done"] = done
+
+        with JmaTileClient(concurrency=concurrency, cache_dir=cache_dir) as client:
+            frames, spec = fetch_window(
+                first_hour,
+                hours,
+                zoom=zoom,
+                step=grid_step,
+                bbox=box,
+                method=resampling,
+                frames_dir=frames_dir,
+                client=client,
+                progress=progress,
+            )
+
+    if not frames:
+        typer.echo(
+            f"no analysis listed between {first_hour:%Y-%m-%dT%H:%M}Z and +{hours} h", err=True
+        )
+        raise typer.Exit(code=1)
+
+    path = out or Path(f"hrpns_{first_hour:%Y%m%d%H}_{hours}h.nc")
+    dataset = to_series_dataset(
+        [(frame.grid, frame.validtime) for frame in frames], zoom=zoom, method=resampling
+    )
+    write_netcdf(dataset, path)
+
+    grid = frames[0].grid
+    summary = {
+        "start": f"{first_hour:%Y%m%d%H}",
+        "hours": hours,
+        "element": DEFAULT_ELEMENT,
+        "grid": {
+            **spec.to_json(),
+            "nlat": int(grid.lat.size),
+            "nlon": int(grid.lon.size),
+            "north": float(grid.lat[0] + spec.dlat / 2.0),
+            "west": float(grid.lon[0] - spec.dlon / 2.0),
+        },
+        "frames": [
+            {
+                "basetime": frame.target.basetime,
+                "validtime": frame.validtime,
+                "path": str(frame.path) if frame.path is not None else None,
+                "observed_cells": int((frame.grid.levels > 0).sum()),
+            }
+            for frame in frames
+        ],
+        "out": str(path),
+    }
+    if as_json:
+        typer.echo(json.dumps(summary, indent=2))
+    else:
+        typer.echo(
+            f"wrote {path} frames={len(frames)} shape={grid.shape} "
+            f"first={frames[0].validtime} last={frames[-1].validtime}"
+        )
 
 
 @app.command()

@@ -125,7 +125,7 @@ GRID_STEPS: Final[dict[int, tuple[float, float]]] = {
 }
 
 DEFAULT_USER_AGENT: Final = (
-    "jma-radar/0.1.0 (+https://github.com/ringsaturn/jma-radar) python-httpx"
+    "jma-radar/0.2.0 (+https://github.com/ringsaturn/jma-radar) python-httpx"
 )
 
 DEFAULT_TIMEOUT: Final = 20.0

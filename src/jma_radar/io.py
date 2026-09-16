@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -31,11 +32,39 @@ from .times import parse_time
 __all__ = [
     "DBZ_DISCLAIMER",
     "DISCLAIMER",
+    "RAIN_RATE_UNITS",
+    "TIME_UNITS",
+    "read_levels",
     "to_dataset",
+    "to_series_dataset",
     "write_geotiff",
     "write_netcdf",
     "write_png",
 ]
+
+#: The unit ``rain_rate`` is written in. ``mm/h`` and ``mm h-1`` are the same
+#: udunits quantity; the slash form is what downstream readers that compare
+#: unit strings (Xue's observation ingest) expect.
+RAIN_RATE_UNITS = "mm/h"
+
+#: The ``time`` coordinate of a series file, CF style, on the Unix epoch.
+TIME_UNITS = "seconds since 1970-01-01T00:00:00+00:00"
+
+#: Packing of ``rain_rate`` in a series file: the class representative values
+#: times two are all whole numbers (1, 6, 15, 30, 50, 80, 130, 200), so a
+#: byte with ``scale_factor`` 0.5 stores them exactly, with 255 as the fill.
+_SERIES_RAIN_RATE_ENCODING: dict[str, Any] = {
+    "dtype": "uint8",
+    "scale_factor": 0.5,
+    "add_offset": 0.0,
+    "_FillValue": 255,
+}
+
+#: Encoding keys carried from a variable into ``to_netcdf``; the rest
+#: (``source``, ``original_shape`` ...) is bookkeeping xarray adds on read.
+_ENCODING_KEYS = frozenset(
+    {"dtype", "scale_factor", "add_offset", "_FillValue", "units", "calendar", "chunksizes"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +143,7 @@ def to_dataset(
             ("lat", "lon"),
             rain_rate,
             {
-                "units": "mm h-1",
+                "units": RAIN_RATE_UNITS,
                 "standard_name": "rainfall_rate",
                 "long_name": "Precipitation intensity (class representative value)",
                 "_FillValue": np.float32(np.nan),
@@ -175,17 +204,124 @@ def to_dataset(
     return dataset
 
 
+def to_series_dataset(
+    frames: Sequence[tuple[LatLonGrid, str]],
+    *,
+    zoom: int,
+    element: str = "hrpns",
+    method: str = "nearest",
+) -> xr.Dataset:
+    """Build one :class:`xarray.Dataset` holding a series of analyses.
+
+    ``frames`` are ``(grid, validtime)`` pairs on one grid, in any order;
+    the result is sorted by time. Variables are ``rain_rate(time, lat, lon)``
+    in mm/h — packed as a byte with ``scale_factor`` 0.5 and fill 255, which
+    holds every class representative value exactly — and
+    ``level(time, lat, lon)``. The ``time`` coordinate is encoded as seconds
+    since the Unix epoch. This is the shape a series reader (Xue's
+    observation ingest, GDAL's NetCDF driver) takes: one band per time,
+    one subdataset per variable.
+    """
+    if not frames:
+        raise ValueError("a series needs at least one frame")
+    ordered = sorted(frames, key=lambda item: item[1])
+    first, _ = ordered[0]
+    for grid, validtime in ordered[1:]:
+        if grid.shape != first.shape or not (
+            np.array_equal(grid.lat, first.lat) and np.array_equal(grid.lon, first.lon)
+        ):
+            raise ValueError(f"frame {validtime} is not on the same grid as {ordered[0][1]}")
+    validtimes = [validtime for _, validtime in ordered]
+    if len(set(validtimes)) != len(validtimes):
+        raise ValueError("a series cannot hold two frames at one time")
+
+    levels = np.stack([np.asarray(grid.levels, dtype=np.uint8) for grid, _ in ordered])
+    rain_rate = level_to_rain_rate_array(levels).astype(np.float32)
+    # Whole seconds since the epoch, written as such rather than left to
+    # xarray's datetime encoding, so the units attribute reads exactly as
+    # TIME_UNITS (xarray would shorten it) — the CF form a series reader parses.
+    times = np.array(
+        [int(parse_time(validtime).timestamp()) for validtime in validtimes], dtype=np.int64
+    )
+
+    single = to_dataset(
+        first, basetime=validtimes[0], validtime=validtimes[0], zoom=zoom, element=element
+    )
+    rain_attrs = dict(single["rain_rate"].attrs)
+    rain_attrs.pop("_FillValue", None)
+    level_attrs = dict(single["level"].attrs)
+
+    dataset = xr.Dataset(
+        data_vars={
+            "rain_rate": (("time", "lat", "lon"), rain_rate, rain_attrs),
+            "level": (("time", "lat", "lon"), levels, level_attrs),
+        },
+        coords={
+            "time": (
+                "time",
+                times,
+                {
+                    "standard_name": "time",
+                    "long_name": "analysis time",
+                    "axis": "T",
+                    "units": TIME_UNITS,
+                    "calendar": "standard",
+                },
+            ),
+            "lat": single["lat"],
+            "lon": single["lon"],
+        },
+        attrs={
+            **{k: v for k, v in single.attrs.items() if k not in {"basetime", "validtime"}},
+            "title": ("Precipitation intensity series from JMA precipitation nowcast tiles"),
+            "first_validtime": _iso(validtimes[0]),
+            "last_validtime": _iso(validtimes[-1]),
+            "frame_count": len(validtimes),
+            "resampling": method,
+        },
+    )
+    nlat, nlon = first.shape
+    dataset["rain_rate"].encoding = {**_SERIES_RAIN_RATE_ENCODING, "chunksizes": (1, nlat, nlon)}
+    dataset["level"].encoding = {"dtype": "uint8", "chunksizes": (1, nlat, nlon)}
+    dataset["time"].encoding = {"dtype": "int64"}
+    return dataset
+
+
+def _netcdf_encoding(dataset: xr.Dataset, *, compress: bool) -> dict[str, dict[str, Any]]:
+    """Per-variable ``to_netcdf`` encodings: what each variable already
+    carries in ``.encoding`` (the packing a series declares), plus deflate
+    on the data variables."""
+    encoding: dict[str, dict[str, Any]] = {}
+    for name, variable in dataset.variables.items():
+        kept = {key: value for key, value in variable.encoding.items() if key in _ENCODING_KEYS}
+        if compress and name in dataset.data_vars:
+            kept.update({"zlib": True, "complevel": 4})
+        if kept:
+            encoding[str(name)] = kept
+    return encoding
+
+
 def write_netcdf(dataset: xr.Dataset, path: str | Path, *, compress: bool = True) -> Path:
     """Write ``dataset`` to a NetCDF4 file and return the path."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    encoding: dict[str, dict[str, Any]] = {}
-    if compress:
-        for name in dataset.data_vars:
-            encoding[str(name)] = {"zlib": True, "complevel": 4}
-    dataset.to_netcdf(out, format="NETCDF4", encoding=encoding)
+    dataset.to_netcdf(out, format="NETCDF4", encoding=_netcdf_encoding(dataset, compress=compress))
     logger.info("wrote %s", out)
     return out
+
+
+def read_levels(path: str | Path) -> LatLonGrid:
+    """Read the level grid back out of a single-frame NetCDF file written by
+    :func:`write_netcdf` — what a frame cache holds."""
+    with xr.open_dataset(path, decode_times=False) as dataset:
+        level = dataset["level"]
+        if level.dims != ("lat", "lon"):
+            raise ValueError(f"{path} is not a single-frame file: level has dims {level.dims}")
+        return LatLonGrid(
+            lat=np.asarray(dataset["lat"].values, dtype=np.float64),
+            lon=np.asarray(dataset["lon"].values, dtype=np.float64),
+            levels=np.asarray(level.values, dtype=np.uint8),
+        )
 
 
 def level_rgba(levels: np.ndarray) -> np.ndarray:

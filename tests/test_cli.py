@@ -101,3 +101,72 @@ def test_fetch_netcdf_with_dbz(httpx_mock: HTTPXMock, fixtures_dir: Path, tmp_pa
     with xr.open_dataset(out) as dataset:
         assert set(dataset.data_vars) == {"cref", "level", "rain_rate"}
         assert dataset["cref"].attrs["units"] == "dBZ"
+
+
+def test_window_json(httpx_mock: HTTPXMock, fixtures_dir: Path, tmp_path: Path) -> None:
+    import json
+
+    validtimes = ["20260916010000", "20260916010500"]
+    listing = [
+        {"basetime": validtime, "validtime": validtime, "elements": ["hrpns"]}
+        for validtime in reversed(validtimes)
+    ]
+    httpx_mock.add_response(
+        url=TARGET_TIMES_URL_TEMPLATE.format(kind="N1"), content=json.dumps(listing).encode()
+    )
+    tile = (fixtures_dir / "hrpns" / "20260916010500_z4_x13_y6.png").read_bytes()
+    for validtime in validtimes:
+        for x, y in domain_tile_range(4):
+            httpx_mock.add_response(url=tile_url(validtime, validtime, 4, x, y), content=tile)
+    out = tmp_path / "window.nc"
+    result = runner.invoke(
+        app,
+        [
+            "window",
+            "--start",
+            "2026091601",
+            "--hours",
+            "1",
+            "--zoom",
+            "4",
+            "--step",
+            "0.5",
+            "--bbox",
+            "130,30,140,40",
+            "--method",
+            "max",
+            "--frames-dir",
+            str(tmp_path / "frames"),
+            "--out",
+            str(out),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.stdout)
+    assert summary["start"] == "2026091601"
+    assert [frame["validtime"] for frame in summary["frames"]] == validtimes
+    assert summary["grid"]["method"] == "max"
+    assert summary["grid"]["nlat"] == 20 and summary["grid"]["nlon"] == 20
+    assert summary["grid"]["north"] == 40.0 and summary["grid"]["west"] == 130.0
+    assert all(Path(frame["path"]).is_file() for frame in summary["frames"])
+    assert out.is_file()
+    with xr.open_dataset(out) as dataset:
+        assert dataset["rain_rate"].dims == ("time", "lat", "lon")
+        assert dataset.sizes["time"] == 2
+
+
+def test_window_with_nothing_listed_fails(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=TARGET_TIMES_URL_TEMPLATE.format(kind="N1"), content=b"[]")
+    result = runner.invoke(app, ["window", "--start", "2026091601", "--zoom", "4"])
+    assert result.exit_code == 1
+    assert "no analysis listed" in result.output
+
+
+def test_window_rejects_bad_arguments() -> None:
+    assert runner.invoke(app, ["window", "--start", "2026091601", "--zoom", "5"]).exit_code != 0
+    assert runner.invoke(app, ["window", "--start", "2026091601", "--hours", "0"]).exit_code != 0
+    assert (
+        runner.invoke(app, ["window", "--start", "2026091601", "--method", "mean"]).exit_code != 0
+    )
+    assert runner.invoke(app, ["window", "--start", "2026091601", "--step", "-1"]).exit_code != 0

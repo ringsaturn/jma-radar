@@ -31,7 +31,17 @@ from .constants import (
     VALID_ZOOMS,
 )
 from .decode import PaletteError, decode_tile, is_empty_tile
-from .io import DBZ_DISCLAIMER, DISCLAIMER, to_dataset, write_geotiff, write_netcdf, write_png
+from .io import (
+    DBZ_DISCLAIMER,
+    DISCLAIMER,
+    RAIN_RATE_UNITS,
+    read_levels,
+    to_dataset,
+    to_series_dataset,
+    write_geotiff,
+    write_netcdf,
+    write_png,
+)
 from .levels import (
     LEVEL_BOUNDS,
     LEVEL_REPRESENTATIVE_RAIN_RATE,
@@ -39,11 +49,12 @@ from .levels import (
     level_to_rain_rate,
     rain_rate_to_dbz,
 )
-from .mosaic import LatLonGrid, assemble_mosaic, make_grid, to_latlon_grid
+from .mosaic import LatLonGrid, ResampleMethod, assemble_mosaic, make_grid, to_latlon_grid
 from .tiles import TileRange, domain_tile_range, tile_bounds
 from .times import TargetTime, latest, parse_target_times, parse_time
+from .window import GridSpec, WindowFrame, fetch_window, parse_start, window_target_times
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BASE_URL",
@@ -58,30 +69,39 @@ __all__ = [
     "LEVEL_LABELS",
     "LEVEL_REPRESENTATIVE_RAIN_RATE",
     "PRODUCT_NAME",
+    "RAIN_RATE_UNITS",
     "VALID_ZOOMS",
+    "GridSpec",
     "JmaTileClient",
     "LatLonGrid",
     "PaletteError",
+    "ResampleMethod",
     "TargetTime",
     "TileRange",
+    "WindowFrame",
     "__version__",
     "assemble_mosaic",
     "decode_tile",
     "domain_tile_range",
     "fetch_dataset",
     "fetch_grid",
+    "fetch_window",
     "is_empty_tile",
     "latest",
     "level_to_dbz",
     "level_to_rain_rate",
     "make_grid",
+    "parse_start",
     "parse_target_times",
     "parse_time",
     "rain_rate_to_dbz",
+    "read_levels",
     "tile_bounds",
     "tile_url",
     "to_dataset",
     "to_latlon_grid",
+    "to_series_dataset",
+    "window_target_times",
     "write_geotiff",
     "write_netcdf",
     "write_png",
@@ -96,6 +116,9 @@ def fetch_grid(
     time: str | None = None,
     valid: str | None = None,
     bbox: tuple[float, float, float, float] | None = None,
+    dlon: float | None = None,
+    dlat: float | None = None,
+    method: ResampleMethod = "nearest",
     concurrency: int = DEFAULT_CONCURRENCY,
     cache_dir: str | Path | None = None,
     element: str = DEFAULT_ELEMENT,
@@ -109,6 +132,9 @@ def fetch_grid(
         time: ``basetime`` as ``YYYYMMDDHHMMSS``, or ``None``/``"latest"``.
         valid: optional ``validtime`` (use ``N2`` times for forecasts).
         bbox: optional ``(west, south, east, north)`` subset.
+        dlon: longitude spacing override in degrees (the zoom's own by default).
+        dlat: latitude spacing override in degrees.
+        method: ``nearest`` or ``max`` (:data:`ResampleMethod`).
         concurrency: number of parallel tile downloads.
         cache_dir: optional directory used to cache raw tiles on disk.
         element: tile element id, ``hrpns`` by default.
@@ -127,7 +153,7 @@ def fetch_grid(
             target.basetime, target.validtime, tile_range, element=element, progress=progress
         )
         mosaic = assemble_mosaic(tiles, tile_range)
-        grid = to_latlon_grid(mosaic, tile_range, bbox=bbox)
+        grid = to_latlon_grid(mosaic, tile_range, bbox=bbox, dlon=dlon, dlat=dlat, method=method)
         return grid, target
     finally:
         if owned:
@@ -140,6 +166,9 @@ def fetch_dataset(
     time: str | None = None,
     valid: str | None = None,
     bbox: tuple[float, float, float, float] | None = None,
+    dlon: float | None = None,
+    dlat: float | None = None,
+    method: ResampleMethod = "nearest",
     concurrency: int = DEFAULT_CONCURRENCY,
     cache_dir: str | Path | None = None,
     element: str = DEFAULT_ELEMENT,
@@ -158,6 +187,9 @@ def fetch_dataset(
         time=time,
         valid=valid,
         bbox=bbox,
+        dlon=dlon,
+        dlat=dlat,
+        method=method,
         concurrency=concurrency,
         cache_dir=cache_dir,
         element=element,

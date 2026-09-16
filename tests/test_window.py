@@ -14,7 +14,7 @@ from pytest_httpx import HTTPXMock
 
 from jma_radar.client import JmaTileClient, tile_url
 from jma_radar.constants import TARGET_TIMES_URL_TEMPLATE
-from jma_radar.io import to_series_dataset, write_netcdf
+from jma_radar.io import to_series_dataset, write_netcdf, write_series
 from jma_radar.tiles import domain_tile_range
 from jma_radar.times import TargetTime, parse_target_times
 from jma_radar.window import GridSpec, fetch_window, parse_start, window_target_times
@@ -206,3 +206,106 @@ def test_series_variable_can_be_named() -> None:
     assert set(dataset.data_vars) == {"prate", "level"}
     assert dataset["prate"].attrs["units"] == "mm/h"
     assert dataset["prate"].encoding["scale_factor"] == 0.5
+
+
+def _plain(value: object) -> object:
+    """An attribute value as something ``==`` compares: arrays as lists, a
+    NaN (which is never equal to itself) as its name."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, float) and np.isnan(value):
+        return "nan"
+    return value
+
+
+def _ncdump(path: Path) -> dict[str, object]:
+    """Everything a reader sees in a NetCDF4 file except the raw bytes: the
+    dimensions, each variable's type, shape, chunking, filters, fill and
+    attributes, and the global attributes, with the write stamp left out."""
+    import netCDF4
+
+    with netCDF4.Dataset(path) as nc:
+        variables = {}
+        for name, var in nc.variables.items():
+            attrs = {key: var.getncattr(key) for key in var.ncattrs()}
+            variables[name] = {
+                "dtype": str(var.dtype),
+                "dims": var.dimensions,
+                "shape": var.shape,
+                "chunking": var.chunking(),
+                "filters": var.filters(),
+                "attrs": {key: _plain(value) for key, value in attrs.items()},
+            }
+        globals_ = {key: nc.getncattr(key) for key in nc.ncattrs() if key != "created"}
+        return {
+            "dims": {name: len(dim) for name, dim in nc.dimensions.items()},
+            "variables": variables,
+            "attrs": globals_,
+        }
+
+
+def test_write_series_matches_the_in_memory_series(tmp_path: Path) -> None:
+    """The streaming writer produces the file the in-memory path does: the
+    same structure, attributes, packing and bytes, whatever order the
+    frames come in."""
+    from jma_radar.constants import MAX_LEVEL
+    from jma_radar.mosaic import LatLonGrid
+
+    rng = np.random.default_rng(1)
+    lat = np.array([40.0, 39.5, 39.0])
+    lon = np.array([130.0, 130.5, 131.0, 131.5])
+    frames = [
+        (
+            LatLonGrid(
+                lat=lat, lon=lon, levels=rng.integers(0, MAX_LEVEL + 1, (3, 4), dtype=np.uint8)
+            ),
+            validtime,
+        )
+        for validtime in ("20260916010500", "20260916010000", "20260916011000")
+    ]
+    # Every class at least once, so every packed byte is exercised.
+    frames[0][0].levels[0, : MAX_LEVEL + 1] = np.arange(MAX_LEVEL + 1, dtype=np.uint8)[:4]
+    frames[1][0].levels.flat[: MAX_LEVEL + 1] = np.arange(MAX_LEVEL + 1, dtype=np.uint8)
+
+    reference = write_netcdf(
+        to_series_dataset(frames, zoom=4, method="max", variable="prate"),
+        tmp_path / "reference.nc",
+    )
+    streamed = write_series(
+        frames, tmp_path / "streamed.nc", zoom=4, method="max", variable="prate"
+    )
+
+    assert _ncdump(streamed) == _ncdump(reference)
+    with (
+        xr.open_dataset(reference, mask_and_scale=False) as raw_reference,
+        xr.open_dataset(streamed, mask_and_scale=False) as raw_streamed,
+    ):
+        for name in ("prate", "level", "time", "lat", "lon"):
+            np.testing.assert_array_equal(raw_streamed[name].values, raw_reference[name].values)
+    with xr.open_dataset(streamed) as decoded:
+        assert list(decoded["time"].values.astype("datetime64[s]").astype(str)) == [
+            "2026-09-16T01:00:00",
+            "2026-09-16T01:05:00",
+            "2026-09-16T01:10:00",
+        ]
+        assert decoded.attrs["frame_count"] == 3
+        assert decoded.attrs["last_validtime"] == "2026-09-16T01:10:00Z"
+        assert np.isnan(decoded["prate"].values[decoded["level"].values == 0]).all()
+        assert (decoded["prate"].values[decoded["level"].values == 3] == 3.0).all()
+
+
+def test_write_series_rejects_what_the_series_rejects(tmp_path: Path) -> None:
+    from jma_radar.mosaic import LatLonGrid
+
+    a = LatLonGrid(lat=np.array([1.0]), lon=np.array([1.0]), levels=np.zeros((1, 1), np.uint8))
+    b = LatLonGrid(lat=np.array([2.0]), lon=np.array([1.0]), levels=np.zeros((1, 1), np.uint8))
+    out = tmp_path / "series.nc"
+    with pytest.raises(ValueError, match="same grid"):
+        write_series([(a, "20260916010000"), (b, "20260916010500")], out, zoom=4)
+    with pytest.raises(ValueError, match="two frames"):
+        write_series([(a, "20260916010000"), (a, "20260916010000")], out, zoom=4)
+    with pytest.raises(ValueError, match="at least one"):
+        write_series([], out, zoom=4)
+    with pytest.raises(ValueError, match="variable name"):
+        write_series([(a, "20260916010000")], out, zoom=4, variable="rain rate")
+    assert not out.exists()

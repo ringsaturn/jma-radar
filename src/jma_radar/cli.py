@@ -13,7 +13,7 @@ import typer
 from . import __version__, fetch_grid
 from .client import DEFAULT_CONCURRENCY, JmaTileClient
 from .constants import DEFAULT_ELEMENT, DEFAULT_ZR_A, DEFAULT_ZR_B, VALID_ZOOMS
-from .io import to_dataset, to_series_dataset, write_geotiff, write_netcdf, write_png
+from .io import to_dataset, write_geotiff, write_netcdf, write_png, write_series
 from .mosaic import ResampleMethod
 from .tiles import domain_tile_range
 from .window import fetch_window, parse_start
@@ -316,13 +316,13 @@ def window(
     path = out or Path(f"hrpns_{first_hour:%Y%m%d%H}_{hours}h.nc")
     if not variable.isidentifier():
         raise typer.BadParameter("variable must be a valid NetCDF variable name")
-    dataset = to_series_dataset(
+    write_series(
         [(frame.grid, frame.validtime) for frame in frames],
+        path,
         zoom=zoom,
         method=resampling,
         variable=variable,
     )
-    write_netcdf(dataset, path)
 
     grid = frames[0].grid
     summary = {

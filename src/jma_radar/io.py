@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import netCDF4
 import numpy as np
 import xarray as xr
 
@@ -40,6 +41,7 @@ __all__ = [
     "write_geotiff",
     "write_netcdf",
     "write_png",
+    "write_series",
 ]
 
 #: The unit ``rain_rate`` is written in. ``mm/h`` and ``mm h-1`` are the same
@@ -59,6 +61,20 @@ _SERIES_RAIN_RATE_ENCODING: dict[str, Any] = {
     "add_offset": 0.0,
     "_FillValue": 255,
 }
+
+#: The byte each class packs to under that encoding (its representative rate
+#: times two), 255 for the no-data class: what a series file stores, computed
+#: from the levels directly rather than through a float array that is then
+#: packed, so a frame costs one byte per cell on the way to the file.
+_PACKED_RAIN_RATE_TABLE: np.ndarray = np.array(
+    [
+        _SERIES_RAIN_RATE_ENCODING["_FillValue"]
+        if np.isnan(rate)
+        else round(rate / _SERIES_RAIN_RATE_ENCODING["scale_factor"])
+        for rate in LEVEL_REPRESENTATIVE_RAIN_RATE
+    ],
+    dtype=np.uint8,
+)
 
 #: Encoding keys carried from a variable into ``to_netcdf``; the rest
 #: (``source``, ``original_shape`` ...) is bookkeeping xarray adds on read.
@@ -223,25 +239,25 @@ def to_series_dataset(
     epoch. This is the shape a series reader (Xue's observation ingest,
     GDAL's NetCDF driver) takes: one band per time, one subdataset per
     variable, found by name — which is why the name is a parameter (Xue
-    reads ``prate``).
+    reads ``prate``). The whole series is held in memory, five bytes a
+    cell a frame; a window on the production grid is written frame by frame
+    by :func:`write_series` instead.
     """
     if not variable.isidentifier():
         raise ValueError(f"variable name {variable!r} is not a valid NetCDF name")
-    if not frames:
-        raise ValueError("a series needs at least one frame")
-    ordered = sorted(frames, key=lambda item: item[1])
+    ordered = _series_frames(frames)
     first, _ = ordered[0]
-    for grid, validtime in ordered[1:]:
-        if grid.shape != first.shape or not (
-            np.array_equal(grid.lat, first.lat) and np.array_equal(grid.lon, first.lon)
-        ):
-            raise ValueError(f"frame {validtime} is not on the same grid as {ordered[0][1]}")
     validtimes = [validtime for _, validtime in ordered]
-    if len(set(validtimes)) != len(validtimes):
-        raise ValueError("a series cannot hold two frames at one time")
 
-    levels = np.stack([np.asarray(grid.levels, dtype=np.uint8) for grid, _ in ordered])
-    rain_rate = level_to_rain_rate_array(levels).astype(np.float32)
+    # One frame at a time: a lookup over the whole stack would first cast it
+    # to a 64-bit index, eight bytes a cell, and the stack of a real window
+    # is a billion cells.
+    nlat, nlon = first.shape
+    levels = np.empty((len(ordered), nlat, nlon), dtype=np.uint8)
+    rain_rate = np.empty((len(ordered), nlat, nlon), dtype=np.float32)
+    for index, (grid, _) in enumerate(ordered):
+        levels[index] = np.asarray(grid.levels, dtype=np.uint8)
+        rain_rate[index] = level_to_rain_rate_array(levels[index])
     # Whole seconds since the epoch, written as such rather than left to
     # xarray's datetime encoding, so the units attribute reads exactly as
     # TIME_UNITS (xarray would shorten it) — the CF form a series reader parses.
@@ -311,6 +327,111 @@ def write_netcdf(dataset: xr.Dataset, path: str | Path, *, compress: bool = True
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_netcdf(out, format="NETCDF4", encoding=_netcdf_encoding(dataset, compress=compress))
+    logger.info("wrote %s", out)
+    return out
+
+
+def _series_frames(frames: Sequence[tuple[LatLonGrid, str]]) -> list[tuple[LatLonGrid, str]]:
+    """The frames of a series sorted by time, checked to be on one grid and
+    at distinct times: what both series writers accept."""
+    if not frames:
+        raise ValueError("a series needs at least one frame")
+    ordered = sorted(frames, key=lambda item: item[1])
+    first, _ = ordered[0]
+    for grid, validtime in ordered[1:]:
+        if grid.shape != first.shape or not (
+            np.array_equal(grid.lat, first.lat) and np.array_equal(grid.lon, first.lon)
+        ):
+            raise ValueError(f"frame {validtime} is not on the same grid as {ordered[0][1]}")
+    validtimes = [validtime for _, validtime in ordered]
+    if len(set(validtimes)) != len(validtimes):
+        raise ValueError("a series cannot hold two frames at one time")
+    return ordered
+
+
+def write_series(
+    frames: Sequence[tuple[LatLonGrid, str]],
+    path: str | Path,
+    *,
+    zoom: int,
+    element: str = "hrpns",
+    method: str = "nearest",
+    variable: str = "rain_rate",
+    compress: bool = True,
+) -> Path:
+    """Write a series of analyses to a NetCDF4 file one frame at a time.
+
+    The file is the one ``write_netcdf(to_series_dataset(frames, ...))``
+    writes: the same variables, attributes, packing, chunking and
+    compression. The difference is the cost of getting there. That path
+    stacks every frame as a float and hands the stack to xarray to pack,
+    which on the production grid (5000 x 5600 cells, 36 frames) peaks near
+    14 GB; this one packs each frame to its byte and writes it, so the peak
+    is the frames a caller already holds plus one frame in flight. ``frames``
+    are ``(grid, validtime)`` pairs on one grid, in any order.
+    """
+    if not variable.isidentifier():
+        raise ValueError(f"variable name {variable!r} is not a valid NetCDF name")
+    ordered = _series_frames(frames)
+    first, first_validtime = ordered[0]
+    validtimes = [validtime for _, validtime in ordered]
+    # A one-frame series carries every attribute and coordinate the file
+    # needs; only the span and the count are the whole series' own.
+    template = to_series_dataset(
+        [(first, first_validtime)], zoom=zoom, element=element, method=method, variable=variable
+    )
+    template.attrs["last_validtime"] = _iso(validtimes[-1])
+    template.attrs["frame_count"] = len(validtimes)
+    times = np.array(
+        [int(parse_time(validtime).timestamp()) for validtime in validtimes], dtype=np.int64
+    )
+    nlat, nlon = first.shape
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with netCDF4.Dataset(out, "w", format="NETCDF4") as nc:
+        nc.createDimension("time", len(ordered))
+        nc.createDimension("lat", nlat)
+        nc.createDimension("lon", nlon)
+        for name, values in (
+            ("time", times),
+            ("lat", template["lat"].values),
+            ("lon", template["lon"].values),
+        ):
+            # xarray gives a float coordinate a NaN fill; the file says so.
+            coord = nc.createVariable(
+                name, values.dtype, (name,), fill_value=np.nan if values.dtype.kind == "f" else None
+            )
+            coord.setncatts(dict(template[name].attrs))
+            coord[:] = values
+        data_options: dict[str, Any] = {
+            "zlib": compress,
+            "complevel": 4,
+            "shuffle": True,
+            "chunksizes": (1, nlat, nlon),
+        }
+        rain = nc.createVariable(
+            variable,
+            np.uint8,
+            ("time", "lat", "lon"),
+            fill_value=_SERIES_RAIN_RATE_ENCODING["_FillValue"],
+            **data_options,
+        )
+        rain.setncatts(
+            {
+                **template[variable].attrs,
+                "scale_factor": _SERIES_RAIN_RATE_ENCODING["scale_factor"],
+                "add_offset": _SERIES_RAIN_RATE_ENCODING["add_offset"],
+            }
+        )
+        rain.set_auto_maskandscale(False)
+        level = nc.createVariable("level", np.uint8, ("time", "lat", "lon"), **data_options)
+        level.setncatts(dict(template["level"].attrs))
+        for index, (grid, _) in enumerate(ordered):
+            levels = np.asarray(grid.levels, dtype=np.uint8)
+            level[index] = levels
+            rain[index] = _PACKED_RAIN_RATE_TABLE[levels]
+        nc.setncatts(dict(template.attrs))
     logger.info("wrote %s", out)
     return out
 

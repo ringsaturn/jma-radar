@@ -179,8 +179,9 @@ small convective cores at random. Neither method averages; the values are classe
 `targetTimes_N1.json` lists the last three hours of analyses. `window` takes every
 analysis whose time lies between `--start` (a `YYYYMMDDHH` hour, or a full JMA stamp)
 and `--start + --hours`, brings each onto one grid, and writes them as **one NetCDF
-series** with a `time` dimension (`rain_rate(time, lat, lon)` and `level(time, lat,
-lon)`; `time` in seconds since the Unix epoch). With `--frames-dir`, every frame is
+series** with a `time` dimension (`rain_rate(time, lat, lon)` — renamed by
+`--variable`, since a series reader finds it by name — and `level(time, lat, lon)`;
+`time` in seconds since the Unix epoch). With `--frames-dir`, every frame is
 also kept as an ordinary single-frame file under a directory keyed by the grid, and a
 later window fetches only the frames it lacks — a rolling rebuild every five minutes
 costs one frame of tiles. `--json` prints a summary (the grid, one entry per frame with

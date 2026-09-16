@@ -210,18 +210,23 @@ def to_series_dataset(
     zoom: int,
     element: str = "hrpns",
     method: str = "nearest",
+    variable: str = "rain_rate",
 ) -> xr.Dataset:
     """Build one :class:`xarray.Dataset` holding a series of analyses.
 
     ``frames`` are ``(grid, validtime)`` pairs on one grid, in any order;
-    the result is sorted by time. Variables are ``rain_rate(time, lat, lon)``
-    in mm/h — packed as a byte with ``scale_factor`` 0.5 and fill 255, which
-    holds every class representative value exactly — and
-    ``level(time, lat, lon)``. The ``time`` coordinate is encoded as seconds
-    since the Unix epoch. This is the shape a series reader (Xue's
-    observation ingest, GDAL's NetCDF driver) takes: one band per time,
-    one subdataset per variable.
+    the result is sorted by time. Variables are the rain rate — named
+    ``variable``, ``rain_rate`` by default, ``(time, lat, lon)`` in mm/h,
+    packed as a byte with ``scale_factor`` 0.5 and fill 255, which holds
+    every class representative value exactly — and ``level(time, lat,
+    lon)``. The ``time`` coordinate is encoded as seconds since the Unix
+    epoch. This is the shape a series reader (Xue's observation ingest,
+    GDAL's NetCDF driver) takes: one band per time, one subdataset per
+    variable, found by name — which is why the name is a parameter (Xue
+    reads ``prate``).
     """
+    if not variable.isidentifier():
+        raise ValueError(f"variable name {variable!r} is not a valid NetCDF name")
     if not frames:
         raise ValueError("a series needs at least one frame")
     ordered = sorted(frames, key=lambda item: item[1])
@@ -253,7 +258,7 @@ def to_series_dataset(
 
     dataset = xr.Dataset(
         data_vars={
-            "rain_rate": (("time", "lat", "lon"), rain_rate, rain_attrs),
+            variable: (("time", "lat", "lon"), rain_rate, rain_attrs),
             "level": (("time", "lat", "lon"), levels, level_attrs),
         },
         coords={
@@ -281,7 +286,7 @@ def to_series_dataset(
         },
     )
     nlat, nlon = first.shape
-    dataset["rain_rate"].encoding = {**_SERIES_RAIN_RATE_ENCODING, "chunksizes": (1, nlat, nlon)}
+    dataset[variable].encoding = {**_SERIES_RAIN_RATE_ENCODING, "chunksizes": (1, nlat, nlon)}
     dataset["level"].encoding = {"dtype": "uint8", "chunksizes": (1, nlat, nlon)}
     dataset["time"].encoding = {"dtype": "int64"}
     return dataset

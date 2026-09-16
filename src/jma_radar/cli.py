@@ -254,6 +254,9 @@ def window(
     out: Annotated[
         Path | None, typer.Option(help="Series NetCDF path; defaults to hrpns_{start}_{hours}h.nc.")
     ] = None,
+    variable: Annotated[
+        str, typer.Option(help="Name of the rain-rate variable in the series file.")
+    ] = "rain_rate",
     cache_dir: Annotated[
         Path | None, typer.Option(help="Directory used to cache raw tiles.")
     ] = None,
@@ -311,8 +314,13 @@ def window(
         raise typer.Exit(code=1)
 
     path = out or Path(f"hrpns_{first_hour:%Y%m%d%H}_{hours}h.nc")
+    if not variable.isidentifier():
+        raise typer.BadParameter("variable must be a valid NetCDF variable name")
     dataset = to_series_dataset(
-        [(frame.grid, frame.validtime) for frame in frames], zoom=zoom, method=resampling
+        [(frame.grid, frame.validtime) for frame in frames],
+        zoom=zoom,
+        method=resampling,
+        variable=variable,
     )
     write_netcdf(dataset, path)
 
@@ -321,6 +329,7 @@ def window(
         "start": f"{first_hour:%Y%m%d%H}",
         "hours": hours,
         "element": DEFAULT_ELEMENT,
+        "variable": variable,
         "grid": {
             **spec.to_json(),
             "nlat": int(grid.lat.size),

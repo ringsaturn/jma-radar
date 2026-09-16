@@ -194,3 +194,15 @@ def test_series_rejects_mismatched_grids_and_duplicate_times() -> None:
         to_series_dataset([(a, "20260916010000"), (a, "20260916010000")], zoom=4)
     with pytest.raises(ValueError, match="at least one"):
         to_series_dataset([], zoom=4)
+    with pytest.raises(ValueError, match="variable name"):
+        to_series_dataset([(a, "20260916010000")], zoom=4, variable="rain rate")
+
+
+def test_series_variable_can_be_named() -> None:
+    from jma_radar.mosaic import LatLonGrid
+
+    grid = LatLonGrid(lat=np.array([1.0]), lon=np.array([1.0]), levels=np.array([[3]], np.uint8))
+    dataset = to_series_dataset([(grid, "20260916010000")], zoom=4, variable="prate")
+    assert set(dataset.data_vars) == {"prate", "level"}
+    assert dataset["prate"].attrs["units"] == "mm/h"
+    assert dataset["prate"].encoding["scale_factor"] == 0.5

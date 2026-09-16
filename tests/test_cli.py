@@ -139,12 +139,15 @@ def test_window_json(httpx_mock: HTTPXMock, fixtures_dir: Path, tmp_path: Path) 
             str(tmp_path / "frames"),
             "--out",
             str(out),
+            "--variable",
+            "prate",
             "--json",
         ],
     )
     assert result.exit_code == 0, result.output
     summary = json.loads(result.stdout)
     assert summary["start"] == "2026091601"
+    assert summary["variable"] == "prate"
     assert [frame["validtime"] for frame in summary["frames"]] == validtimes
     assert summary["grid"]["method"] == "max"
     assert summary["grid"]["nlat"] == 20 and summary["grid"]["nlon"] == 20
@@ -152,7 +155,7 @@ def test_window_json(httpx_mock: HTTPXMock, fixtures_dir: Path, tmp_path: Path) 
     assert all(Path(frame["path"]).is_file() for frame in summary["frames"])
     assert out.is_file()
     with xr.open_dataset(out) as dataset:
-        assert dataset["rain_rate"].dims == ("time", "lat", "lon")
+        assert dataset["prate"].dims == ("time", "lat", "lon")
         assert dataset.sizes["time"] == 2
 
 

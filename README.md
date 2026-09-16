@@ -154,10 +154,10 @@ jma-radar fetch --zoom 6 --format png     --out preview.png
 jma-radar fetch --zoom 6 --format geotiff --out hrpns.tif  # rain_rate band; needs the 'geotiff' extra
 
 # Your own grid: a square 0.01° step, each cell the strongest class it contains
-jma-radar fetch --zoom 8 --step 0.01 --method max --bbox 121,20.5,149,45.5 --out hrpns_0p01.nc
+jma-radar fetch --zoom 8 --step 0.005 --method max --bbox 121,20.5,149,45.5 --out hrpns_0p005.nc
 
 # A window of analyses as one series file (see below)
-jma-radar window --start 2026091523 --hours 3 --zoom 8 --step 0.01 --method max \
+jma-radar window --start 2026091523 --hours 3 --zoom 8 --step 0.005 --method max \
     --bbox 121,20.5,149,45.5 --frames-dir ~/.cache/jma-radar/frames --out window.nc --json
 ```
 
@@ -167,8 +167,9 @@ named `hrpns_{validtime}.{nc,tif,png}`. `python -m jma_radar` is the same entry 
 ### Resampling: `--method nearest | max`
 
 The output grid is coarser than the tile pixels at every zoom that is worth fetching
-(a z8 pixel is about 0.0055° of longitude; the default z8 grid is 1/80° × 1/120°, and a
-0.01° grid holds about 2 × 2 pixels per cell). `nearest` takes the pixel under each
+(a z8 pixel is about 0.0055° of longitude; the default z8 grid is 1/80° × 1/120°, a
+0.01° grid holds about 2 × 2 pixels per cell, and 0.005° is about one pixel per cell —
+the finest grid z8 supports). `nearest` takes the pixel under each
 cell centre. `max` takes the highest class among the pixels whose centres fall in the
 cell: the classes are ordered by intensity, so this is the strongest rain the cell
 contains — the way radar products are thinned, since a nearest-neighbour pick drops
@@ -223,7 +224,7 @@ jma_radar.write_png(grid, "preview.png")  # quick-look, JMA colours
 
 # A window of analyses, frames cached one file each, stacked into one series
 frames, spec = jma_radar.fetch_window(
-    "2026091523", 3, zoom=8, step=0.01, bbox=(121, 20.5, 149, 45.5), method="max",
+    "2026091523", 3, zoom=8, step=0.005, bbox=(121, 20.5, 149, 45.5), method="max",
     frames_dir="~/.cache/jma-radar/frames",
 )
 series = jma_radar.to_series_dataset([(f.grid, f.validtime) for f in frames], zoom=8, method="max")

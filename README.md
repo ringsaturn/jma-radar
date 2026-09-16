@@ -185,8 +185,11 @@ series** with a `time` dimension (`rain_rate(time, lat, lon)` — renamed by
 `time` in seconds since the Unix epoch). With `--frames-dir`, every frame is
 also kept as an ordinary single-frame file under a directory keyed by the grid, and a
 later window fetches only the frames it lacks — a rolling rebuild every five minutes
-costs one frame of tiles. `--json` prints a summary (the grid, one entry per frame with
-its cache path) on stdout; progress and logs go to stderr.
+costs one frame of tiles. The series is written one frame at a time
+(`write_series`), so a window on the production grid (5000 x 5600 cells, 36 frames)
+needs about 1.5 GB rather than the 14 GB of stacking every frame as a float and packing
+the stack; the file is the same either way. `--json` prints a summary (the grid, one
+entry per frame with its cache path) on stdout; progress and logs go to stderr.
 
 In the series file `rain_rate` is packed as a byte with `scale_factor = 0.5` and
 `_FillValue = 255`: every class representative value is a whole half-millimetre, so
@@ -227,6 +230,8 @@ frames, spec = jma_radar.fetch_window(
     "2026091523", 3, zoom=8, step=0.005, bbox=(121, 20.5, 149, 45.5), method="max",
     frames_dir="~/.cache/jma-radar/frames",
 )
+jma_radar.write_series([(f.grid, f.validtime) for f in frames], "window.nc", zoom=8, method="max")
+# or, for a small window held in memory as an xarray.Dataset:
 series = jma_radar.to_series_dataset([(f.grid, f.validtime) for f in frames], zoom=8, method="max")
 jma_radar.write_netcdf(series, "window.nc")
 

@@ -41,6 +41,7 @@ from .io import (
     write_geotiff,
     write_netcdf,
     write_png,
+    write_series,
 )
 from .levels import (
     LEVEL_BOUNDS,
@@ -105,6 +106,7 @@ __all__ = [
     "write_geotiff",
     "write_netcdf",
     "write_png",
+    "write_series",
 ]
 
 logger = logging.getLogger(__name__)

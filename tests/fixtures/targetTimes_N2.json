@@ -1,0 +1,14 @@
+[
+  {"basetime": "20260916010500", "validtime": "20260916020500", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916020000", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916015500", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916015000", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916014500", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916014000", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916013500", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916013000", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916012500", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916012000", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916011500", "elements": ["hrpns", "hrpns_nd"]}
+ ,{"basetime": "20260916010500", "validtime": "20260916011000", "elements": ["hrpns", "hrpns_nd"]}
+]
